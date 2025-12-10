@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, traceback, html, random
-from datetime import datetime
+import os
+import re
+import sys
+import time
+import json
+import traceback
+import html
+import random
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Dict, Any
+
 import requests
 from dotenv import load_dotenv
 
@@ -16,114 +24,117 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
-# Webhook #1
-ALTRADY_WEBHOOK_URL   = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
-ALTRADY_API_KEY       = os.getenv("ALTRADY_API_KEY", "").strip()
-ALTRADY_API_SECRET    = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE      = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()
-
-# Optionaler Webhook #2 (eigene Creds/Exchange)
-ALTRADY_WEBHOOK_URL_2 = os.getenv("ALTRADY_WEBHOOK_URL_2", "").strip()
-ALTRADY_API_KEY_2     = os.getenv("ALTRADY_API_KEY_2", "").strip()
-ALTRADY_API_SECRET_2  = os.getenv("ALTRADY_API_SECRET_2", "").strip()
-ALTRADY_EXCHANGE_2    = os.getenv("ALTRADY_EXCHANGE_2", "").strip()
-
 QUOTE = os.getenv("QUOTE", "USDT").strip().upper()
 
-# Getrennte Hebel je Webhook
-LEVERAGE_1 = int(os.getenv("LEVERAGE_1", "5"))
-LEVERAGE_2 = int(os.getenv("LEVERAGE_2", "10"))
+# 3Commas Webhook (Signal Bot - Custom Signal)
+TC_WEBHOOK_URL = os.getenv("TC_WEBHOOK_URL", "").strip()
+TC_SECRET      = os.getenv("TC_SECRET", "").strip()
+TC_BOT_UUID    = os.getenv("TC_BOT_UUID", "").strip()
+TC_MAX_LAG     = int(os.getenv("TC_MAX_LAG", "300"))
 
-# Limit-Order Ablauf (Zeit – generelle Max-Dauer)
-ENTRY_EXPIRATION_MIN        = int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
+# TradingView Mapping
+TV_EXCHANGE     = os.getenv("TV_EXCHANGE", "BINANCE").strip()
+TV_INSTR_SUFFIX = os.getenv("TV_INSTR_SUFFIX", ".P").strip()
 
-# Entry-Condition
-ENTRY_WAIT_MINUTES          = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))           # 0 = keine Zeit-Bedingung
-ENTRY_TRIGGER_BUFFER_PCT    = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0")) # z.B. 0.0 oder 0.8
-ENTRY_EXPIRATION_PRICE_PCT  = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0"))
-
-TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"    # Für Tests
-
-# Poll-Steuerung
-POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
-POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
-POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
-
+# Poll-Steuerung (Discord)
+POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "15"))
+POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "0"))
+POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "3"))
 DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "50"))
-STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 
-# Cooldown nach Order-Open
+STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "0"))  # 0 = aus
+
+TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"
 
 # =========================
 # Startup Checks
 # =========================
-if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
-    print("❌ ENV fehlt: DISCORD_TOKEN, CHANNEL_ID, ALTRADY_WEBHOOK_URL")
+if not DISCORD_TOKEN or not CHANNEL_ID or not TC_WEBHOOK_URL:
+    print("❌ ENV fehlt: DISCORD_TOKEN, CHANNEL_ID oder TC_WEBHOOK_URL")
     sys.exit(1)
 
-if not ALTRADY_API_KEY or not ALTRADY_API_SECRET:
-    print("❌ API Keys fehlen: ALTRADY_API_KEY, ALTRADY_API_SECRET")
+if not TC_SECRET or not TC_BOT_UUID:
+    print("❌ ENV fehlt: TC_SECRET oder TC_BOT_UUID")
     sys.exit(1)
 
 HEADERS = {
-    "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady/3.0-entry-only"
+    "Authorization": DISCORD_TOKEN,   # z.B. "Bot xxxxx"
+    "User-Agent": "DiscordTo3Commas/1.0"
 }
 
 # =========================
-# Utils
+# State-Handling
 # =========================
-def load_state():
+def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except:
+        except Exception:
             pass
+    # default
     return {"last_id": None, "last_trade_ts": 0.0}
 
-def save_state(st: dict):
+def save_state(st: Dict[str, Any]) -> None:
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(st), encoding="utf-8")
     tmp.replace(STATE_FILE)
 
-def sleep_until_next_tick():
+# =========================
+# Timing / Polling
+# =========================
+def sleep_until_next_tick() -> None:
+    """
+    Poll alle POLL_BASE_SECONDS mit leichtem Jitter, um
+    Discord-Rate-Limits harmonisch zu halten.
+    """
     now = time.time()
     period_start = (now // POLL_BASE_SECONDS) * POLL_BASE_SECONDS
     next_tick = period_start + POLL_BASE_SECONDS + POLL_OFFSET_SECONDS
     if now < period_start + POLL_OFFSET_SECONDS:
         next_tick = period_start + POLL_OFFSET_SECONDS
     jitter = random.uniform(0, max(0, POLL_JITTER_MAX))
-    time.sleep(max(0, next_tick - now + jitter))
+    sleep_for = max(0, next_tick - now + jitter)
+    time.sleep(sleep_for)
 
-def fetch_messages_after(channel_id: str, after_id: Optional[str], limit: int = 50):
-    collected = []
-    params = {"limit": max(1, min(limit, 100))}
+# =========================
+# Discord Fetch
+# =========================
+def fetch_messages_after(channel_id: str, after_id: Optional[str], limit: int = 50) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    params: Dict[str, Any] = {"limit": max(1, min(limit, 100))}
     if after_id:
         params["after"] = str(after_id)
 
     while True:
         r = requests.get(
             f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            headers=HEADERS, params=params, timeout=15
+            headers=HEADERS,
+            params=params,
+            timeout=15
         )
         if r.status_code == 429:
             retry = 5
             try:
-                if r.headers.get("Content-Type","").startswith("application/json"):
+                if r.headers.get("Content-Type", "").startswith("application/json"):
                     retry = float(r.json().get("retry_after", 5))
-            except:
+            except Exception:
                 pass
-            print(f"⚠️ Rate Limit, warte {retry} Sekunden...")
+            print(f"⚠️ Discord Rate Limit, warte {retry} Sekunden...")
             time.sleep(retry + 0.5)
             continue
+
         r.raise_for_status()
         page = r.json() or []
         collected.extend(page)
+
         if len(page) < params["limit"]:
             break
-        max_id = max(int(m.get("id","0")) for m in page if "id" in m)
+
+        # Für Pagination
+        max_id = max(int(m.get("id", "0")) for m in page if "id" in m)
         params["after"] = str(max_id)
+
     return collected
 
 # =========================
@@ -135,7 +146,8 @@ MULTI_WS  = re.compile(r"[ \t\u00A0]+")
 NUM       = r"([0-9][0-9,]*\.?[0-9]*)"
 
 def clean_markdown(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = s.replace("\r", "")
     s = html.unescape(s)
     s = MD_LINK.sub(r"\1", s)
@@ -147,9 +159,13 @@ def clean_markdown(s: str) -> str:
 def to_price(s: str) -> float:
     return float(s.replace(",", ""))
 
-def message_text(m: dict) -> str:
-    parts = []
+def message_text(m: Dict[str, Any]) -> str:
+    parts: List[str] = []
+
+    # Normaler Content
     parts.append(m.get("content") or "")
+
+    # Embeds
     embeds = m.get("embeds") or []
     for e in embeds:
         if not isinstance(e, dict):
@@ -171,39 +187,49 @@ def message_text(m: dict) -> str:
         footer = (e.get("footer") or {}).get("text")
         if footer:
             parts.append(str(footer))
+
     return clean_markdown("\n".join([p for p in parts if p]))
 
 # =========================
-# Signal Parsing (nur Pair, Side, Entry)
+# Signal Parsing (Pair, Side, Entry)
 # =========================
 PAIR_LINE_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
 HDR_SLASH_PAIR  = re.compile(r"([A-Z0-9]+)\s*/\s*[A-Z0-9]+\b.*\b(LONG|SHORT)\b", re.I)
 HDR_COIN_DIR    = re.compile(r"Coin\s*:\s*([A-Z0-9]+).*?Direction\s*:\s*(LONG|SHORT)", re.I | re.S)
 
-ENTER_ON_TRIGGER = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*"+NUM, re.I)
-ENTRY_COLON      = re.compile(r"\bEntry\s*:\s*\$?\s*"+NUM, re.I)
-ENTRY_SECTION    = re.compile(r"\bENTRY\b\s*\n\s*\$?\s*"+NUM, re.I)
+ENTER_ON_TRIGGER = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*" + NUM, re.I)
+ENTRY_COLON      = re.compile(r"\bEntry\s*:\s*\$?\s*" + NUM, re.I)
+ENTRY_SECTION    = re.compile(r"\bENTRY\b\s*\n\s*\$?\s*" + NUM, re.I)
 
 def find_base_side(txt: str):
+    """
+    Versucht, Coin und Richtung (long/short) aus dem Signaltext zu lesen.
+    """
     mh = HDR_SLASH_PAIR.search(txt)
     if mh:
-        return mh.group(1).upper(), ("long" if mh.group(2).upper()=="LONG" else "short")
+        return mh.group(1).upper(), ("long" if mh.group(2).upper() == "LONG" else "short")
+
     mo = PAIR_LINE_OLD.search(txt)
     if mo:
-        return mo.group(2).upper(), ("long" if mo.group(3).upper()=="LONG" else "short")
+        return mo.group(2).upper(), ("long" if mo.group(3).upper() == "LONG" else "short")
+
     mc = HDR_COIN_DIR.search(txt)
     if mc:
-        return mc.group(1).upper(), ("long" if mc.group(2).upper()=="LONG" else "short")
+        return mc.group(1).upper(), ("long" if mc.group(2).upper() == "LONG" else "short")
+
     return None, None
 
 def find_entry(txt: str) -> Optional[float]:
+    """
+    Sucht Entry-Preis (Enter on Trigger / Entry: / ENTRY-Block).
+    """
     for rx in (ENTER_ON_TRIGGER, ENTRY_COLON, ENTRY_SECTION):
         m = rx.search(txt)
         if m:
             return to_price(m.group(1))
     return None
 
-def parse_signal_from_text(txt: str):
+def parse_signal_from_text(txt: str) -> Optional[Dict[str, Any]]:
     base, side = find_base_side(txt)
     if not base or not side:
         return None
@@ -212,152 +238,97 @@ def parse_signal_from_text(txt: str):
         return None
     return {
         "base": base,
-        "side": side,
+        "side": side,   # "long" oder "short"
         "entry": entry
     }
 
 # =========================
-# Altrady Payload (nur Entry)
+# 3Commas Payload (Custom Signal)
 # =========================
-def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str, leverage: int) -> dict:
+def build_3commas_payload(sig: Dict[str, Any]) -> Dict[str, Any]:
     base  = sig["base"]
     side  = sig["side"]
     entry = sig["entry"]
 
-    symbol = f"{exchange}_{QUOTE}_{base}"
+    # 3Commas Actions: enter_long / enter_short / exit_long / exit_short
+    action = "enter_long" if side == "long" else "enter_short"
 
-    # Entry-Trigger & Expiration-Price
-    if side == "long":
-        trigger_price = entry * (1.0 - ENTRY_TRIGGER_BUFFER_PCT/100.0)
-        expire_price  = (
-            entry * (1.0 + ENTRY_EXPIRATION_PRICE_PCT/100.0)
-            if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
-        )
-    else:
-        trigger_price = entry * (1.0 + ENTRY_TRIGGER_BUFFER_PCT/100.0)
-        expire_price  = (
-            entry * (1.0 - ENTRY_EXPIRATION_PRICE_PCT/100.0)
-            if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
-        )
+    # Instrument-String wie TradingView: z.B. "BTCUSDT.P"
+    tv_instrument = f"{base}{QUOTE}{TV_INSTR_SUFFIX}"
 
-    payload = {
-        "api_key": api_key,
-        "api_secret": api_secret,
-        "exchange": exchange,
-        "action": "open",
-        "symbol": symbol,
-        "side": side,
-        "order_type": "limit",
-        "signal_price": entry,
-        "leverage": leverage,
-        "entry_condition": {
-            "price": float(f"{trigger_price:.10f}")
-        },
-        "entry_expiration": {
-            "time": ENTRY_EXPIRATION_MIN
-        }
-        # KEINE take_profit, stop_loss, dca_orders – das macht der Bot
+    # ISO8601 UTC Timestamp
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    payload: Dict[str, Any] = {
+        "secret": TC_SECRET,
+        "max_lag": str(TC_MAX_LAG),
+        "timestamp": timestamp,
+        "trigger_price": f"{entry:.8f}",
+        "tv_exchange": TV_EXCHANGE,
+        "tv_instrument": tv_instrument,
+        "action": action,
+        "bot_uuid": TC_BOT_UUID
+        # Order-Sizing etc. macht der Bot per UI, kein "order" notwendig
     }
 
-    if expire_price is not None:
-        payload["entry_expiration"]["price"] = float(f"{expire_price:.10f}")
-
-    if ENTRY_WAIT_MINUTES > 0:
-        payload["entry_condition"]["time"] = ENTRY_WAIT_MINUTES
-        payload["entry_condition"]["operator"] = "OR"
-
-    if TEST_MODE:
-        payload["test"] = True
-
-    # Kurz-Log
-    print(f"\n📊 {base} {side.upper()}  |  {symbol}  |  Entry {entry}")
-    print(
-        f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
-        + (f" oder Preis {expire_price:.6f}" if expire_price else "")
-    )
-
+    print(f"\n📊 {base} {side.upper()} | {tv_instrument} | Entry {entry}")
+    print(f"   → action={action}, trigger_price={entry:.8f}")
     return payload
 
-# =========================
-# HTTP (pro Webhook)
-# =========================
-def _post_one(url: str, payload: dict):
-    print(f"   📤 Sende an {url} ...")
+def send_to_3commas(payload: Dict[str, Any]) -> None:
+    if TEST_MODE:
+        print("🧪 TEST_MODE aktiv – Payload NICHT gesendet:")
+        print(json.dumps(payload, indent=2))
+        return
+
+    print("   📤 Sende an 3Commas Webhook ...")
     for attempt in range(3):
         try:
-            r = requests.post(url, json=payload, timeout=20)
+            r = requests.post(TC_WEBHOOK_URL, json=payload, timeout=20)
 
             if r.status_code == 429:
                 delay = 2.0
                 try:
-                    if r.headers.get("Content-Type","").startswith("application/json"):
+                    if r.headers.get("Content-Type", "").startswith("application/json"):
                         delay = float(r.json().get("retry_after", 2.0))
-                except:
+                except Exception:
                     pass
-                print(f"   ⚠️ Rate Limit, warte {delay} Sekunden...")
+                print(f"   ⚠️ 3Commas Rate Limit, warte {delay} Sekunden...")
                 time.sleep(delay + 0.25)
                 continue
 
-            if r.status_code == 204:
-                print("   ✅ Erfolg! Pending order angelegt (wartet auf Trigger).")
-                return r
-
             if not r.ok:
-                # Debug: zeig uns die Server-Antwort (z.B. bei 422)
-                print(f"   ❌ Server-Antwort {r.status_code}: {r.text}")
+                print(f"   ❌ 3Commas Antwort {r.status_code}: {r.text}")
                 r.raise_for_status()
 
             print("   ✅ Erfolg!")
-            return r
+            return
         except Exception as e:
             if attempt == 2:
-                print(f"   ❌ Fehler bei {url}: {e}")
+                print(f"   ❌ Fehler beim Senden an 3Commas: {e}")
                 raise
             wait = 1.5 * (attempt + 1)
             print(f"   ⚠️ Retry in {wait:.1f}s wegen: {e}")
             time.sleep(wait)
 
-def post_to_all_webhooks(payloads_and_urls: List[Tuple[str, dict]]):
-    last_resp = None
-    for i, (url, payload) in enumerate(payloads_and_urls, 1):
-        print(f"→ Webhook #{i} von {len(payloads_and_urls)}")
-        try:
-            last_resp = _post_one(url, payload)
-        except Exception as e:
-            print(f"   ⚠️ Weiter mit nächstem Webhook (Fehler: {e})")
-            continue
-    return last_resp
-
 # =========================
-# Main
+# Main Loop
 # =========================
-def main():
-    print("="*50)
-    print("🚀 Discord → Altrady Bot v3.0 (Entry-only, TPs/DCA/SL im Bot)")
-    print("="*50)
-    print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {LEVERAGE_1}x")
-    if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
-        print(f"Exchange #2: {ALTRADY_EXCHANGE_2} | Leverage: {LEVERAGE_2}x")
-    print(
-        f"Entry: Buffer {ENTRY_TRIGGER_BUFFER_PCT}% | Expire {ENTRY_EXPIRATION_MIN} min"
-        + (f" + Expire-Price ±{ENTRY_EXPIRATION_PRICE_PCT}% (Gewinnrichtung)" if ENTRY_EXPIRATION_PRICE_PCT>0 else "")
-    )
-    if ENTRY_WAIT_MINUTES > 0:
-        print(f"Entry-Condition Time: {ENTRY_WAIT_MINUTES} min (OR)")
-    if COOLDOWN_SECONDS > 0:
-        print(f"Cooldown: {COOLDOWN_SECONDS}s")
+def main() -> None:
+    print("=" * 60)
+    print("🚀 Discord → 3Commas Signal Bot (Custom Signal, Entry-only)")
+    print("=" * 60)
+    print(f"Exchange: {TV_EXCHANGE} | Quote: {QUOTE}")
+    print(f"POLL_BASE_SECONDS={POLL_BASE_SECONDS}, JITTER_MAX={POLL_JITTER_MAX}")
     if TEST_MODE:
-        print("⚠️ TEST MODE aktiv")
-
-    active_webhooks = 1 + int(bool(ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2))
-    print(f"Webhooks aktiv: {active_webhooks}")
-    print("-"*50)
+        print("⚠️ TEST_MODE aktiv – keine realen Trades.")
+    print("-" * 60)
 
     state = load_state()
     last_id = state.get("last_id")
     last_trade_ts = float(state.get("last_trade_ts", 0.0))
 
-    # Erststart: baseline auf aktuellste Message setzen (nicht rückwirkend)
+    # Erststart: baseline = aktuellste Message -> keine Retro-Trades
     if last_id is None:
         try:
             page = fetch_messages_after(CHANNEL_ID, None, limit=1)
@@ -365,25 +336,27 @@ def main():
                 last_id = str(page[0]["id"])
                 state["last_id"] = last_id
                 save_state(state)
-        except:
-            pass
+                print(f"🏁 Initialisiere last_id mit {last_id}")
+        except Exception as e:
+            print(f"⚠️ Konnte initiale last_id nicht setzen: {e}")
 
-    print("👀 Überwache Channel...\n")
+    print("👀 Überwache Discord-Channel...\n")
 
     while True:
         try:
             msgs = fetch_messages_after(CHANNEL_ID, last_id, limit=DISCORD_FETCH_LIMIT)
-            msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
+            msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id", "0")))
             max_seen = int(last_id or 0)
 
             if not msgs_sorted:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Warte auf Signale...")
+                ts = datetime.now().strftime('%H:%M:%S')
+                print(f"[{ts}] Keine neuen Signale...")
             else:
                 for m in msgs_sorted:
-                    mid = int(m.get("id","0"))
+                    mid = int(m.get("id", "0"))
                     raw = message_text(m)
 
-                    # Cooldown: blocke neue Orders kurz nach dem letzten Open
+                    # einfacher Cooldown (optional)
                     if COOLDOWN_SECONDS > 0 and (time.time() - last_trade_ts) < COOLDOWN_SECONDS:
                         max_seen = max(max_seen, mid)
                         continue
@@ -391,20 +364,8 @@ def main():
                     if raw:
                         sig = parse_signal_from_text(raw)
                         if sig:
-                            # Payload #1
-                            p1 = build_altrady_open_payload(
-                                sig, ALTRADY_EXCHANGE, ALTRADY_API_KEY, ALTRADY_API_SECRET, LEVERAGE_1
-                            )
-                            jobs = [(ALTRADY_WEBHOOK_URL, p1)]
-
-                            # Payload #2 (optional)
-                            if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
-                                p2 = build_altrady_open_payload(
-                                    sig, ALTRADY_EXCHANGE_2, ALTRADY_API_KEY_2, ALTRADY_API_SECRET_2, LEVERAGE_2
-                                )
-                                jobs.append((ALTRADY_WEBHOOK_URL_2, p2))
-
-                            post_to_all_webhooks(jobs)
+                            payload = build_3commas_payload(sig)
+                            send_to_3commas(payload)
                             last_trade_ts = time.time()
                             state["last_trade_ts"] = last_trade_ts
 
@@ -415,10 +376,10 @@ def main():
                 save_state(state)
 
         except KeyboardInterrupt:
-            print("\n👋 Beendet")
+            print("\n👋 Manuell beendet.")
             break
         except Exception as e:
-            print(f"❌ Fehler: {e}")
+            print(f"❌ Unerwarteter Fehler: {e}")
             traceback.print_exc()
             time.sleep(10)
         finally:
